@@ -65,7 +65,8 @@ func BuildGraph(rows []SegmentInput) *Graph {
 }
 
 // ShortestPath 返回两物理站间里程最短的路径边序列（Dijkstra）。
-// 起终点相同返回空路径、0 里程（同站进出不收费由计价层体现）。
+// 起终点相同返回空路径、0 里程；计价层对 0 里程照收起步价
+// （同站进出按最低票价计，属正常收费行程而非免费）。
 func (g *Graph) ShortestPath(origin, destination int64) ([]Edge, int, error) {
 	if origin == destination {
 		if _, ok := g.adj[origin]; !ok {

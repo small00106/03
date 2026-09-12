@@ -121,19 +121,17 @@ func TestPairEvents(t *testing.T) {
 			Ticket: ticketFull, Time: base.Add(time.Duration(minute) * time.Minute)}
 	}
 
-	// A 卡：正常一对 + 缺出站的进站；B 卡：缺进站的出站 + 正常一对。
-	// 两卡交错给出，验证不会跨卡配对。
+	// A 卡：正常一对 + 序列末尾一次未闭合进站（在途，非异常）；
+	// B 卡：缺进站的出站（异常）+ 正常一对；两卡交错给出，验证不跨卡配对。
 	events := []GateEvent{
 		ev(1, "A", Enter, 1, 0),
 		ev(2, "B", Exit, 5, 1), // B 无进站 -> 异常
 		ev(3, "A", Exit, 5, 2), // A 正常配对 (1,3)
 		ev(4, "B", Enter, 1, 3),
-		ev(5, "A", Enter, 1, 4), // A 再进站
-		// A 再无出站 -> 异常
+		ev(5, "A", Enter, 1, 4), // A 23:55 式在途进站，且再无出站
 		ev(6, "B", Exit, 5, 5),  // B 正常配对 (4,6)
-		ev(7, "A", Enter, 1, 6), // A 连续进站：5 号异常，7 号待配对
 	}
-	trips, unmatched := PairEvents(events)
+	trips, openEnters, anomalies := PairEvents(events)
 
 	if len(trips) != 2 {
 		t.Fatalf("配对数 = %d, want 2", len(trips))
@@ -145,17 +143,80 @@ func TestPairEvents(t *testing.T) {
 		t.Errorf("第二对 = (%d,%d), want (4,6)", trips[1].Enter.ID, trips[1].Exit.ID)
 	}
 
-	var unmatchedIDs []int64
-	for _, e := range unmatched {
-		unmatchedIDs = append(unmatchedIDs, e.ID)
+	// 未闭合的 A 卡进站是在途，不得被报成异常。
+	if len(openEnters) != 1 || openEnters[0].ID != 5 {
+		t.Fatalf("在途进站 = %v, want 仅事件 5", openEnters)
 	}
-	wantUnmatched := map[int64]bool{2: true, 5: true, 7: true}
-	if len(unmatchedIDs) != len(wantUnmatched) {
-		t.Fatalf("异常事件 = %v, want %v", unmatchedIDs, wantUnmatched)
+	if len(anomalies) != 1 || anomalies[0].ID != 2 {
+		t.Fatalf("异常事件 = %v, want 仅事件 2（无进站的出站）", anomalies)
 	}
-	for _, id := range unmatchedIDs {
-		if !wantUnmatched[id] {
-			t.Errorf("事件 %d 不应被判为异常", id)
-		}
+}
+
+// TestPairEventsSupersededEnter 连续两次进站：旧进站被冲掉算异常，
+// 新进站与随后出站正常配对。
+func TestPairEventsSupersededEnter(t *testing.T) {
+	base := time.Date(2025, 3, 1, 8, 0, 0, 0, testTZ)
+	ev := func(id int64, d Direction, minute int) GateEvent {
+		return GateEvent{ID: id, CardNo: "A", Direction: d, StationID: 1,
+			Ticket: ticketFull, Time: base.Add(time.Duration(minute) * time.Minute)}
+	}
+	trips, open, anomalies := PairEvents([]GateEvent{
+		ev(1, Enter, 0), // 被下一次进站冲掉
+		ev(2, Enter, 5),
+		ev(3, Exit, 30),
+	})
+	if len(trips) != 1 || trips[0].Enter.ID != 2 || trips[0].Exit.ID != 3 {
+		t.Fatalf("配对 = %+v, want (2,3)", trips)
+	}
+	if len(open) != 0 {
+		t.Errorf("在途 = %v, want 空", open)
+	}
+	if len(anomalies) != 1 || anomalies[0].ID != 1 {
+		t.Errorf("异常 = %v, want 仅事件 1", anomalies)
+	}
+}
+
+// TestPairEventsCrossMidnight 跨零点的进出仍配成同一趟行程，
+// 且配对完成后无在途、无异常。
+func TestPairEventsCrossMidnightPairing(t *testing.T) {
+	enter := GateEvent{ID: 1, CardNo: "A", Direction: Enter, StationID: 1,
+		Ticket: ticketFull, Time: timeInTZ("2025-12-31T23:55:00+08:00")}
+	exit := GateEvent{ID: 2, CardNo: "A", Direction: Exit, StationID: 2,
+		Ticket: ticketFull, Time: timeInTZ("2026-01-01T00:30:00+08:00")}
+	trips, open, anomalies := PairEvents([]GateEvent{enter, exit})
+	if len(trips) != 1 || trips[0].Enter.ID != 1 || trips[0].Exit.ID != 2 {
+		t.Fatalf("跨零点未配成一对: %+v", trips)
+	}
+	if len(open) != 0 || len(anomalies) != 0 {
+		t.Errorf("跨零点配对后 open=%v anomalies=%v, 均应为空", open, anomalies)
+	}
+}
+
+// TestSameStationTripChargesBaseFare 同站进出：里程 0，但按起步价收费，
+// 全价 300、敬老卡实付 0 而原价仍 300。
+func TestSameStationTripChargesBaseFare(t *testing.T) {
+	book, _ := NewRuleBook([]RuleVersion{rule2024()})
+	g := NewGraph()
+	g.AddEdge(1, 2, Edge{SegmentID: 1, DistanceM: 4000}) // 1 号站需在网内
+	eng := NewEngine(g, book, testTZ)
+	enter := timeInTZ("2025-03-01T10:00:00+08:00")
+
+	q, err := eng.Price(1, 1, ticketFull, enter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.DistanceM != 0 || len(q.Path) != 0 {
+		t.Errorf("同站里程 = %d, 路径段 = %d, want 0/0", q.DistanceM, len(q.Path))
+	}
+	if q.FullFareCents != 300 || q.PaidFareCents != 300 {
+		t.Errorf("同站全价 full=%d paid=%d, want 300/300（收起步价）", q.FullFareCents, q.PaidFareCents)
+	}
+
+	qs, err := eng.Price(1, 1, ticketSenior, enter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qs.FullFareCents != 300 || qs.PaidFareCents != 0 {
+		t.Errorf("同站敬老 full=%d paid=%d, want 300/0", qs.FullFareCents, qs.PaidFareCents)
 	}
 }

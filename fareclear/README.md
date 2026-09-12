@@ -41,6 +41,11 @@ fareclear/
 - `STUDENT` 学生票：五折（万分位 5000bp），半分半数向上取整；
 - `SENIOR` 敬老卡：实付 0，**仍按原价写入 `full_fare_cents` 与 `trip_legs`**，作为对运营方清分的依据。
 
+**同站进出**：里程 0、无路径区间，但按起步价 3 元收费（AFC 通行口径）。
+
+**票种停用**：`active=FALSE` 的票种在 `InsertGateEvents` 写入边界被拒绝（`ErrTicketTypeInactive`）；
+计价本身不读 active，停用前已落库的事件与跨天在途行程仍能正常计价。
+
 版本选择口径：`travel_date = 进站时刻在业务时区（Asia/Shanghai）下的日历日`。
 跨零点行程（23:50 进站、次日 00:20 出站）仍按进站当天生效的版本计价。
 
@@ -66,11 +71,14 @@ _, _ = st.InsertGateEvents(ctx, []store.GateEventInput{
 })
 
 // 事务内：取未入账事件 → 配对 → 寻路 → 选版本 → 计价 → 写 trips / trip_legs
-trips, unmatched, err := st.ProcessCard(ctx, "C001", eng)
+trips, openEnters, anomalies, err := st.ProcessCard(ctx, "C001", eng)
 ```
 
 已被 `trips` 引用的事件不会重复计价（`ProcessCard` 只捞未引用事件并 `FOR UPDATE` 锁定）。
-无法配对的事件（连续进站、无进站的出站）通过 `errors.Is(err, store.ErrUnpairedEvents)` 取得附件列表。
+配对结果分三类：已成账行程 `trips`、在途未闭合进站 `openEnters`（23:55 进站、
+次日出站的正常状态，**不算异常、不报错**，下次处理时跨天配对）、真正无法配对的
+`anomalies`（无进站的出站、被新进站冲掉的旧进站），后者同时以
+`errors.Is(err, store.ErrUnpairedEvents)` 返回。
 
 ## 测试
 

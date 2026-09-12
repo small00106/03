@@ -227,7 +227,17 @@ type GateEventInput struct {
 	GateCode     string
 }
 
-// InsertGateEvents 批量写入闸机事件并返回带库内 ID 的事件。
+// ErrTicketTypeInactive 票种已停用，不得再用于新产生的闸机事件。
+// 停用前已落库的事件与在途行程不受影响：计价只认 fare_kind/discount_bp，
+// 不读 active，否则跨天在途会因票种停用而无法计价。
+var ErrTicketTypeInactive = errors.New("store: ticket type is inactive")
+
+// ErrUnknownTicketType 票种 id 不存在。
+var ErrUnknownTicketType = errors.New("store: unknown ticket type")
+
+// InsertGateEvents 批量写入闸机事件并返回带库内 ID 与完整票种信息的事件，
+// 返回值可直接交给 fare.PairEvents / Engine.PricePair 计价。
+// 停用票种在此写入边界被拒绝（ErrTicketTypeInactive）。
 func (s *Store) InsertGateEvents(ctx context.Context, in []GateEventInput) ([]fare.GateEvent, error) {
 	if len(in) == 0 {
 		return nil, nil
@@ -237,6 +247,48 @@ func (s *Store) InsertGateEvents(ctx context.Context, in []GateEventInput) ([]fa
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+
+	// 一次性取本批涉及的票种（含 active 校验）。
+	idSet := make(map[int64]struct{})
+	ids := make([]int64, 0, len(in))
+	for _, e := range in {
+		if _, ok := idSet[e.TicketTypeID]; !ok {
+			idSet[e.TicketTypeID] = struct{}{}
+			ids = append(ids, e.TicketTypeID)
+		}
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT id, code, name, fare_kind, discount_bp, active
+		FROM ticket_types WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	tickets := make(map[int64]fare.TicketType, len(ids))
+	for rows.Next() {
+		var tt fare.TicketType
+		var kind string
+		var active bool
+		if err := rows.Scan(&tt.ID, &tt.Code, &tt.Name, &kind, &tt.DiscountBp, &active); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		tt.Kind = fare.TicketKind(kind)
+		tt.Active = active
+		tickets[tt.ID] = tt
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		tt, ok := tickets[id]
+		if !ok {
+			return nil, fmt.Errorf("%w: id=%d", ErrUnknownTicketType, id)
+		}
+		if !tt.Active {
+			return nil, fmt.Errorf("%w: %s", ErrTicketTypeInactive, tt.Code)
+		}
+	}
 
 	out := make([]fare.GateEvent, 0, len(in))
 	for _, e := range in {
@@ -251,6 +303,7 @@ func (s *Store) InsertGateEvents(ctx context.Context, in []GateEventInput) ([]fa
 			return nil, err
 		}
 		ge.CardNo = e.CardNo
+		ge.Ticket = tickets[e.TicketTypeID] // 关键：回填完整票种，否则免费/折扣票会被按全价计
 		ge.Time = e.Time.UTC()
 		ge.Direction = e.Direction
 		ge.StationID = e.StationID
@@ -279,19 +332,23 @@ type TripRecord struct {
 	Status               string
 }
 
-// ErrUnpairedEvents 表示该卡存在无法配对的事件（连续进站/无进站的出站等）。
+// ErrUnpairedEvents 表示该卡存在真正无法配对的异常事件
+// （无进站的出站、被新进站冲掉的旧进站）。在途未闭合的进站不在此列。
 var ErrUnpairedEvents = errors.New("store: unpaired gate events")
 
 // ProcessCard 对一张卡尚未入账的事件做配对、计价并落库。
 // 整批在一个事务内完成：事件行 FOR UPDATE 锁定，行程只追加不改写；
-// 已被 trips 引用的事件不会重复计价。
+// 已被 trips 引用的事件不会重复计价。跨零点在途天然支持：昨晚的进站
+// 尚未被引用，今晨出站到达后两者会在同一次查询中被捞出配对，
+// 行程 travel_date 仍取进站当天。
 //
-// 无法配对的异常事件作为 ErrUnpairedEvents 的附件返回（目前不落库），
-// 调用方可据此挂账或推送核查。
-func (s *Store) ProcessCard(ctx context.Context, cardNo string, eng *fare.Engine) (created []TripRecord, unmatched []fare.GateEvent, err error) {
+// openEnters 为截至目前仍未闭合的进站（乘客在途，次日出站再配对），
+// 属正常状态、不构成错误；anomalies 为真正无法配对的事件（无进站的
+// 出站、被新进站冲掉的旧进站），同时以 ErrUnpairedEvents 返回。
+func (s *Store) ProcessCard(ctx context.Context, cardNo string, eng *fare.Engine) (created []TripRecord, openEnters []fare.GateEvent, anomalies []fare.GateEvent, err error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer tx.Rollback(ctx)
 
@@ -308,7 +365,7 @@ func (s *Store) ProcessCard(ctx context.Context, cardNo string, eng *fare.Engine
 		ORDER BY ge.event_time, ge.id
 		FOR UPDATE OF ge`, cardNo)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var events []fare.GateEvent
 	for rows.Next() {
@@ -318,7 +375,7 @@ func (s *Store) ProcessCard(ctx context.Context, cardNo string, eng *fare.Engine
 			&ge.Ticket.ID, &ge.Ticket.Code, &ge.Ticket.Name, &kind, &ge.Ticket.DiscountBp,
 			&ge.Time, &direction, &ge.StationID, &ge.GateCode); err != nil {
 			rows.Close()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		ge.Ticket.Kind = fare.TicketKind(kind)
 		ge.Direction = fare.Direction(direction)
@@ -326,28 +383,28 @@ func (s *Store) ProcessCard(ctx context.Context, cardNo string, eng *fare.Engine
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	pairs, unpaired := fare.PairEvents(events)
+	pairs, open, bad := fare.PairEvents(events)
 	for _, p := range pairs {
 		q, perr := eng.PricePair(p)
 		if perr != nil {
-			return nil, nil, fmt.Errorf("store: price trip card=%s: %w", cardNo, perr)
+			return nil, nil, nil, fmt.Errorf("store: price trip card=%s: %w", cardNo, perr)
 		}
 		rec, ierr := s.insertTrip(ctx, tx, p, q)
 		if ierr != nil {
-			return nil, nil, ierr
+			return nil, nil, nil, ierr
 		}
 		created = append(created, rec)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	if len(unpaired) > 0 {
-		return created, unpaired, fmt.Errorf("%w: %d event(s)", ErrUnpairedEvents, len(unpaired))
+	if len(bad) > 0 {
+		return created, open, bad, fmt.Errorf("%w: %d event(s)", ErrUnpairedEvents, len(bad))
 	}
-	return created, nil, nil
+	return created, open, nil, nil
 }
 
 func (s *Store) insertTrip(ctx context.Context, tx pgx.Tx, p fare.PairedTrip, q fare.Quote) (TripRecord, error) {

@@ -68,12 +68,16 @@ func (e *Engine) PricePair(t PairedTrip) (Quote, error) {
 
 // PairEvents 把原始闸机事件按时间配对成行程（不同卡互不干扰）。
 // 配对规则（无状态 FIFO）：
-//   - 进站后第一次出站配成一对；
-//   - 连续两次进站：前一次进站无出站，记为异常，以新进站为准；
-//   - 没有待配对进站时收到出站：记为异常。
+//   - 进站后第一次出站配成一对（允许跨零点：23:55 进站、次日 00:20
+//     出站仍是同一趟行程，计价归属进站当天）；
+//   - 连续两次进站：旧进站被新进站冲掉，旧进站进 anomalies；
+//   - 没有待配对进站时收到出站：该出站进 anomalies；
+//   - 序列末尾仍未闭合的进站（人还在车上、出站记录尚未产生）属于
+//     正常在途，进 openEnters 而非 anomalies——日终批处理每天都会遇到
+//     这种状态，次日出站事件到达后再配对。
 //
-// 返回成功配对与未能配对的事件（异常），顺序均保持时间序。
-func PairEvents(events []GateEvent) (trips []PairedTrip, unmatched []GateEvent) {
+// 三个返回切片均保持事件时间序。
+func PairEvents(events []GateEvent) (trips []PairedTrip, openEnters []GateEvent, anomalies []GateEvent) {
 	sorted := make([]GateEvent, len(events))
 	copy(sorted, events)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -84,40 +88,45 @@ func PairEvents(events []GateEvent) (trips []PairedTrip, unmatched []GateEvent) 
 	})
 
 	pending := make(map[string]*GateEvent)
-	var unmatchedOrder []GateEvent
+	var anomalyList []GateEvent
 	for i := range sorted {
 		ev := sorted[i]
 		switch ev.Direction {
 		case Enter:
 			if p := pending[ev.CardNo]; p != nil {
-				unmatchedOrder = append(unmatchedOrder, *p)
+				anomalyList = append(anomalyList, *p)
 			}
 			p := ev
 			pending[ev.CardNo] = &p
 		case Exit:
 			p := pending[ev.CardNo]
 			if p == nil {
-				unmatchedOrder = append(unmatchedOrder, ev)
+				anomalyList = append(anomalyList, ev)
 				continue
 			}
 			trips = append(trips, PairedTrip{Enter: *p, Exit: ev})
 			pending[ev.CardNo] = nil
 		}
 	}
-	// 收集仍未闭合的进站，按事件时间输出。
+	// 仍未闭合的进站是在途行程，不是异常。
 	for _, p := range pending {
 		if p != nil {
-			unmatchedOrder = append(unmatchedOrder, *p)
+			openEnters = append(openEnters, *p)
 		}
 	}
-	sort.SliceStable(unmatchedOrder, func(i, j int) bool {
-		if !unmatchedOrder[i].Time.Equal(unmatchedOrder[j].Time) {
-			return unmatchedOrder[i].Time.Before(unmatchedOrder[j].Time)
-		}
-		return unmatchedOrder[i].ID < unmatchedOrder[j].ID
-	})
+	byTime := func(s []GateEvent) {
+		sort.SliceStable(s, func(i, j int) bool {
+			if !s[i].Time.Equal(s[j].Time) {
+				return s[i].Time.Before(s[j].Time)
+			}
+			return s[i].ID < s[j].ID
+		})
+	}
+	byTime(openEnters)
+	anomalies = anomalyList
+	byTime(anomalies)
 	sort.SliceStable(trips, func(i, j int) bool {
 		return trips[i].Enter.Time.Before(trips[j].Enter.Time)
 	})
-	return trips, unmatchedOrder
+	return trips, openEnters, anomalies
 }
