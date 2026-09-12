@@ -227,9 +227,18 @@ type GateEventInput struct {
 	GateCode     string
 }
 
-// ErrTicketTypeInactive 票种已停用，不得再用于新产生的闸机事件。
-// 停用前已落库的事件与在途行程不受影响：计价只认 fare_kind/discount_bp，
-// 不读 active，否则跨天在途会因票种停用而无法计价。
+// ErrTicketTypeInactive 票种已停用，不得再用于开新行程（进站事件）。
+//
+// 边界刻意卡在「进站」而非所有闸机事件：闸机必须永远放行出站。
+// 典型时序——乘客 23:50 持敬老卡进站，运营随后停用 SENIOR，次日 00:20
+// 出站——若连出站也拒绝，在途行程将永远无法闭合、卡永远停在站内。
+// 因此：
+//   - enter + 停用票种 → 拒绝（不得用退役票种开始新行程）；
+//   - exit  + 停用票种 → 照常写入（闭合既有在途行程；无进站可配时
+//     走既有 anomalies 流程）。
+//
+// 计价只认 fare_kind/discount_bp，不读 active，因此停用前的历史行程
+// 与跨越停用时点的在途行程都不受影响。
 var ErrTicketTypeInactive = errors.New("store: ticket type is inactive")
 
 // ErrUnknownTicketType 票种 id 不存在。
@@ -237,7 +246,8 @@ var ErrUnknownTicketType = errors.New("store: unknown ticket type")
 
 // InsertGateEvents 批量写入闸机事件并返回带库内 ID 与完整票种信息的事件，
 // 返回值可直接交给 fare.PairEvents / Engine.PricePair 计价。
-// 停用票种在此写入边界被拒绝（ErrTicketTypeInactive）。
+// 停用票种仅在进站方向被拒绝（ErrTicketTypeInactive），出站始终放行；
+// 不存在的票种 id 两个方向都拒绝（ErrUnknownTicketType）。
 func (s *Store) InsertGateEvents(ctx context.Context, in []GateEventInput) ([]fare.GateEvent, error) {
 	if len(in) == 0 {
 		return nil, nil
@@ -248,7 +258,7 @@ func (s *Store) InsertGateEvents(ctx context.Context, in []GateEventInput) ([]fa
 	}
 	defer tx.Rollback(ctx)
 
-	// 一次性取本批涉及的票种（含 active 校验）。
+	// 一次性取本批涉及的票种（含 active）。
 	idSet := make(map[int64]struct{})
 	ids := make([]int64, 0, len(in))
 	for _, e := range in {
@@ -280,12 +290,15 @@ func (s *Store) InsertGateEvents(ctx context.Context, in []GateEventInput) ([]fa
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	for _, id := range ids {
-		tt, ok := tickets[id]
+	// 校验（在任何 INSERT 之前，失败整批回滚）：
+	// 票种不存在两个方向都拒绝；停用票种只拒绝进站，出站永远放行——
+	// 否则票种在乘客在途期间被停用，这趟行程将永远无法出站闭合。
+	for _, e := range in {
+		tt, ok := tickets[e.TicketTypeID]
 		if !ok {
-			return nil, fmt.Errorf("%w: id=%d", ErrUnknownTicketType, id)
+			return nil, fmt.Errorf("%w: id=%d", ErrUnknownTicketType, e.TicketTypeID)
 		}
-		if !tt.Active {
+		if !tt.Active && e.Direction == fare.Enter {
 			return nil, fmt.Errorf("%w: %s", ErrTicketTypeInactive, tt.Code)
 		}
 	}

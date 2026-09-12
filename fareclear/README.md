@@ -43,8 +43,11 @@ fareclear/
 
 **同站进出**：里程 0、无路径区间，但按起步价 3 元收费（AFC 通行口径）。
 
-**票种停用**：`active=FALSE` 的票种在 `InsertGateEvents` 写入边界被拒绝（`ErrTicketTypeInactive`）；
-计价本身不读 active，停用前已落库的事件与跨天在途行程仍能正常计价。
+**票种停用**：`active=FALSE` 的票种在 `InsertGateEvents` 的**进站方向**被拒绝
+（`ErrTicketTypeInactive`），不得用退役票种开新行程；**出站方向始终放行**——
+乘客在途期间票种被停用（如 23:50 进站、运营停用、次日 00:20 出站），
+出站事件必须能写入、行程必须能闭合。计价本身不读 active，只认 fare_kind/discount_bp，
+因此停用前的历史行程与跨越停用时点的在途行程不受影响。
 
 版本选择口径：`travel_date = 进站时刻在业务时区（Asia/Shanghai）下的日历日`。
 跨零点行程（23:50 进站、次日 00:20 出站）仍按进站当天生效的版本计价。

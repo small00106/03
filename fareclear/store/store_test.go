@@ -64,10 +64,13 @@ func setupFixture(t *testing.T) *fixture {
 	}
 	t.Cleanup(admin.Close)
 
-	// 测试专用停用票种（不动种子里的 STUDENT，避免污染其他用例）。
+	// 测试专用票种：
+	//   PROMO-DISABLED —— 长期停用，用于验证进站被拒；
+	//   SENIOR-RETIRE  —— 免费票，用例内动态启停，模拟在途期间被停用。
 	if _, err := admin.Exec(ctx, `
 		INSERT INTO ticket_types(code, name, fare_kind, discount_bp, active)
-		VALUES ('PROMO-DISABLED', '停用促销票', 'rate', 8000, FALSE)
+		VALUES ('PROMO-DISABLED', '停用促销票', 'rate', 8000, FALSE),
+		       ('SENIOR-RETIRE',  '临停敬老卡', 'free', 0,    TRUE)
 		ON CONFLICT (code) DO NOTHING`); err != nil {
 		t.Fatal(err)
 	}
@@ -352,6 +355,19 @@ func TestStoreInactiveTicketRejected(t *testing.T) {
 		t.Fatalf("不存在票种写入: err=%v, want ErrUnknownTicketType", err)
 	}
 
+	// 出站方向不卡 active：闸机必须永远放行出站。
+	exitCard := card("INACTIVE-EXIT")
+	if _, err := f.st.InsertGateEvents(ctx, []store.GateEventInput{
+		{CardNo: exitCard, TicketTypeID: inactiveID, Time: when.Add(time.Hour), Direction: fare.Exit, StationID: f.s2},
+	}); err != nil {
+		t.Fatalf("停用票种的出站应放行: %v", err)
+	}
+	// 这是一笔没有进站可配的出站，进入 anomalies 而非写入失败。
+	_, _, exitAnomalies, perr := f.st.ProcessCard(ctx, exitCard, f.eng)
+	if !errors.Is(perr, store.ErrUnpairedEvents) || len(exitAnomalies) != 1 {
+		t.Errorf("无进站出站: err=%v anomalies=%d, want ErrUnpairedEvents/1", perr, len(exitAnomalies))
+	}
+
 	// 被拒事件不得落库（按本次卡号计数，与历史运行残留隔离）。
 	var n int
 	if err := f.admin.QueryRow(ctx,
@@ -380,5 +396,123 @@ func TestStoreInactiveTicketRejected(t *testing.T) {
 	// rate 8000bp（八折），26km 原价 800 → 实付 640。
 	if trips[0].FullFareCents != 800 || trips[0].PaidFareCents != 640 {
 		t.Errorf("历史行程 full=%d paid=%d, want 800/640", trips[0].FullFareCents, trips[0].PaidFareCents)
+	}
+}
+
+// TestStoreRetirementMidTrip 回归 active 边界：开关必须卡在「进站」而非
+// 所有事件。乘客 23:50 持敬老卡进站，运营在其在途期间停用该票种，
+// 次日 00:20 出站必须照常写入并跨天闭合；停用之后再拿同票种进站则拒绝。
+func TestStoreRetirementMidTrip(t *testing.T) {
+	f := setupFixture(t)
+	ctx := context.Background()
+
+	var retireID int64
+	if err := f.admin.QueryRow(ctx,
+		`SELECT id FROM ticket_types WHERE code='SENIOR-RETIRE'`).Scan(&retireID); err != nil {
+		t.Fatal(err)
+	}
+	// 每个用例独立重置票种为启用，保证可重复执行。
+	if _, err := f.admin.Exec(ctx, `UPDATE ticket_types SET active=TRUE WHERE id=$1`, retireID); err != nil {
+		t.Fatal(err)
+	}
+
+	c := card("RETIRE-MIDTRIP")
+
+	// 23:50 持敬老卡进站（票种仍启用）。
+	enterAt := time.Date(2025, 6, 10, 23, 50, 0, 0, f.loc)
+	enters, err := f.st.InsertGateEvents(ctx, []store.GateEventInput{
+		{CardNo: c, TicketTypeID: retireID, Time: enterAt, Direction: fare.Enter, StationID: f.s1},
+	})
+	if err != nil {
+		t.Fatalf("停用前进站被拒: %v", err)
+	}
+	if enters[0].Ticket.Kind != fare.KindFree {
+		t.Fatalf("返回事件票种 Kind=%q, want free", enters[0].Ticket.Kind)
+	}
+
+	// 运营在乘客在途期间停用票种。
+	if _, err := f.admin.Exec(ctx, `UPDATE ticket_types SET active=FALSE WHERE id=$1`, retireID); err != nil {
+		t.Fatal(err)
+	}
+
+	// 次日 00:20 出站：active=FALSE 也必须放行，否则这趟行程永远闭合不了。
+	exitAt := time.Date(2025, 6, 11, 0, 20, 0, 0, f.loc)
+	if _, err := f.st.InsertGateEvents(ctx, []store.GateEventInput{
+		{CardNo: c, TicketTypeID: retireID, Time: exitAt, Direction: fare.Exit, StationID: f.s2},
+	}); err != nil {
+		t.Fatalf("停用后出站被拒（在途行程将无法闭合）: %v", err)
+	}
+
+	// 跨天配对成同一趟：归属进站日，敬老卡 full=300（S1->S2 4km 起步价）、paid=0。
+	trips, open, anomalies, perr := f.st.ProcessCard(ctx, c, f.eng)
+	if perr != nil || len(open) != 0 || len(anomalies) != 0 {
+		t.Fatalf("跨停用配对: err=%v open=%d anomalies=%d", perr, len(open), len(anomalies))
+	}
+	if len(trips) != 1 {
+		t.Fatalf("行程数 = %d, want 1", len(trips))
+	}
+	tr := trips[0]
+	if tr.TravelDate.Format("2006-01-02") != "2025-06-10" {
+		t.Errorf("归属日 = %s, want 2025-06-10（进站日）", tr.TravelDate.Format("2006-01-02"))
+	}
+	if tr.FullFareCents != 300 || tr.PaidFareCents != 0 {
+		t.Errorf("跨停用行程 full=%d paid=%d, want 300/0（原价照落、实付 0）", tr.FullFareCents, tr.PaidFareCents)
+	}
+	if got := tr.Version.Code; got != "FARE-2024" {
+		t.Errorf("规则版本 = %s, want FARE-2024", got)
+	}
+
+	// 票种已停用，次日用它开新行程（进站）必须拒绝；
+	// 同批的出站不受影响——整批中只有进站方向触发拒绝。
+	newCard := card("RETIRE-NEW")
+	_, err = f.st.InsertGateEvents(ctx, []store.GateEventInput{
+		{CardNo: newCard, TicketTypeID: retireID, Time: time.Date(2025, 6, 11, 8, 0, 0, 0, f.loc), Direction: fare.Enter, StationID: f.s1},
+	})
+	if !errors.Is(err, store.ErrTicketTypeInactive) {
+		t.Fatalf("停用后新开行程: err=%v, want ErrTicketTypeInactive", err)
+	}
+	var n int
+	if err := f.admin.QueryRow(ctx,
+		`SELECT count(*) FROM gate_events WHERE card_no=$1`, newCard).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("被拒进站残留 %d 行, want 0", n)
+	}
+
+	// 同一时序在种子 SENIOR 本尊上再走一遍（你实测点名的票种）：
+	// 23:50 持 SENIOR 进站 → 运营停用 SENIOR → 次日 00:20 出站必须成功。
+	t.Cleanup(func() {
+		_, _ = f.admin.Exec(context.Background(),
+			`UPDATE ticket_types SET active=TRUE WHERE code='SENIOR'`)
+	})
+	seniorCard := card("SENIOR-MIDTRIP")
+	seniorEnter := time.Date(2025, 6, 12, 23, 50, 0, 0, f.loc)
+	if _, err := f.st.InsertGateEvents(ctx, []store.GateEventInput{
+		{CardNo: seniorCard, TicketTypeID: f.senior, Time: seniorEnter, Direction: fare.Enter, StationID: f.s1},
+	}); err != nil {
+		t.Fatalf("SENIOR 停用前进站被拒: %v", err)
+	}
+	if _, err := f.admin.Exec(ctx,
+		`UPDATE ticket_types SET active=FALSE WHERE code='SENIOR'`); err != nil {
+		t.Fatal(err)
+	}
+	seniorExitEvents, err := f.st.InsertGateEvents(ctx, []store.GateEventInput{
+		{CardNo: seniorCard, TicketTypeID: f.senior, Time: time.Date(2025, 6, 13, 0, 20, 0, 0, f.loc), Direction: fare.Exit, StationID: f.s2},
+	})
+	if err != nil {
+		t.Fatalf("SENIOR 停用后出站被拒（在途行程无法闭合）: %v", err)
+	}
+	if len(seniorExitEvents) != 1 || seniorExitEvents[0].Ticket.Kind != fare.KindFree {
+		t.Fatalf("出站返回事件票种异常: %+v", seniorExitEvents)
+	}
+	strips, sopen, sanom, serr := f.st.ProcessCard(ctx, seniorCard, f.eng)
+	if serr != nil || len(sopen) != 0 || len(sanom) != 0 || len(strips) != 1 {
+		t.Fatalf("SENIOR 跨停用配对: err=%v trips=%d open=%d anomalies=%d", serr, len(strips), len(sopen), len(sanom))
+	}
+	if strips[0].TravelDate.Format("2006-01-02") != "2025-06-12" ||
+		strips[0].FullFareCents != 300 || strips[0].PaidFareCents != 0 {
+		t.Errorf("SENIOR 跨停用行程 date=%s full=%d paid=%d, want 2025-06-12/300/0",
+			strips[0].TravelDate.Format("2006-01-02"), strips[0].FullFareCents, strips[0].PaidFareCents)
 	}
 }
